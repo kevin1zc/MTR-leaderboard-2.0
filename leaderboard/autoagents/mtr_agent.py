@@ -34,6 +34,10 @@ class MTRAgent(AutonomousAgent):
         self._simulation_steps = 0
         self._last_control = None
 
+        self._route_min_distance = 4.0
+        self._route = None
+        self._route_parsed = False
+
         mtr_dir = os.path.dirname(common_utils.__file__)
 
         cfg_path = os.path.join(mtr_dir, "../../tools/cfgs/waymo/mtr+100_percent_data.yaml")
@@ -92,6 +96,13 @@ class MTRAgent(AutonomousAgent):
         ]
         return sensors
 
+    def parse_route(self):
+        self._route = deque()
+        for pos, cmd in self._global_plan_world_coord:
+            pos = np.array([pos.location.x, pos.location.y])
+            self._route.append((pos, cmd))
+        self._route_parsed = True
+
     def parse_carla_data(self, track_ids):
         info = {}
         info['scenario_id'] = "scenario_0"
@@ -143,6 +154,8 @@ class MTRAgent(AutonomousAgent):
             Use the self._global_plan member to access the geolocation route and self._global_plan_world_coord for 
             its world location counterpart.
         """
+        if not self._route_parsed:
+            self.parse_route()
 
         if timestamp < 2:
             return carla.VehicleControl()
@@ -161,6 +174,15 @@ class MTRAgent(AutonomousAgent):
 
         # actors = CarlaDataProvider.get_actors()
         ego_transform = player.get_transform()
+        cur_pos = np.array([ego_transform.location.x, ego_transform.location.y])
+
+        if len(self._route) == 1:
+            target_pos, _ = self._route[0]
+        else:
+            target_pos, _ = self._route[1]
+            distance = np.linalg.norm(target_pos - cur_pos)
+            if distance < self._route_min_distance:
+                self._route.popleft()
 
         def dist(l):
             return math.sqrt((l.x - ego_transform.location.x) ** 2 + (l.y - ego_transform.location.y)
