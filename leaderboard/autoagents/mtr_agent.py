@@ -58,12 +58,9 @@ class MTRAgent(AutonomousAgent):
         model_dir = os.path.abspath(model_dir)
 
         map_info_path = os.path.join(model_dir, 'map_infos.pkl')
-        dynamic_map_info_path = os.path.join(model_dir, 'dynamic_map_infos.pkl')
 
         with open(map_info_path, 'rb') as file:
             self.map_infos = pickle.load(file)
-        with open(dynamic_map_info_path, 'rb') as file:
-            self.dynamic_map_infos = pickle.load(file)
 
         model_path = os.path.join(model_dir, "latest_model.pth")
         model_path = os.path.abspath(model_path)
@@ -213,7 +210,6 @@ class MTRAgent(AutonomousAgent):
         info['vehicle_ids'] = track_ids
 
         info['map_infos'] = self.map_infos
-        info['dynamic_map_infos'] = self.dynamic_map_infos
         ret_infos = create_scene_level_data(info, cfg.DATA_CONFIG)
         batch_dict = {
             'batch_size': 1,
