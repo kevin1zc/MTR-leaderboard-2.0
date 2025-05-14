@@ -8,22 +8,12 @@ import numpy as np
 import pickle
 import torch
 import carla
-import time
-
-import psutil, gc, tracemalloc
 
 from mtr.config import cfg, cfg_from_yaml_file
 from mtr.models import model as model_utils
 from mtr.utils import common_utils
-
-# from carla_api.utils.world import World
-# from carla_api.utils.carla_utils import HUD
-
 from carla_api.utils.mtr_data_utils import create_scene_level_data, decode_map_features, generate_prediction_dicts
 from carla_api.agents.navigation.behavior_agent import BehaviorAgent
-
-from carla_api.mpc.mpc_solver import MpcController
-from carla_api.mpc.config import N, dt
 
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
@@ -39,17 +29,14 @@ class MTRAgent(AutonomousAgent):
 
     def __init__(self, carla_host, carla_port, debug=False):
         super().__init__(carla_host, carla_port, debug=False)
-        self._trajectories = defaultdict(partial(deque, maxlen=11))
         self._delta_t = 0.05
+        self._trajectories = defaultdict(partial(deque, maxlen=11))
+        self._simulation_steps = 0
+        self._last_control = None
 
         self._route_min_distance = 4.0
         self._route = None
         self._route_parsed = False
-
-        self._simulation_steps = 0
-        self.last_control = None
-        self.use_precomputed_waypoints = True
-        self.follow_agent = False
 
         mtr_dir = os.path.dirname(common_utils.__file__)
 
@@ -85,13 +72,7 @@ class MTRAgent(AutonomousAgent):
         self.model.cuda()
         self.model.eval()
 
-        self.world = CarlaDataProvider.get_world()
-        self.player = CarlaDataProvider.get_hero_actor()
-
-        self.temp_agent = BehaviorAgent(self.player, behavior='normal', opt_dict={
-            'sampling_resolution': 0.24})  # this may change later for trafic lights etc.
-
-        self.mpc = MpcController(self.world, self.player, horizon=N, dt=dt)
+        self.agent = None
 
     def setup(self, path_to_conf_file):
         self.track = Track.SENSORS  # At a minimum, this method sets the Leaderboard modality. In this case, SENSORS
@@ -116,13 +97,11 @@ class MTRAgent(AutonomousAgent):
         return sensors
 
     def parse_route(self):
-        self._route = []  # deque()
+        self._route = deque()
         for pos, cmd in self._global_plan_world_coord:
-            pos = [pos.location.x, pos.location.y]  # np.array([pos.location.x, pos.location.y])
-            self._route.append(pos)  # self._route.append((pos, cmd))
-
+            pos = np.array([pos.location.x, pos.location.y])
+            self._route.append((pos, cmd))
         self._route_parsed = True
-        self._route = np.array(self._route)
 
     def parse_carla_data(self, track_ids):
         info = {}
@@ -161,54 +140,6 @@ class MTRAgent(AutonomousAgent):
 
         return track_infos
 
-    def get_ego_vehicle_state(self):
-        transform = self.player.get_transform()
-        x = transform.location.x
-        y = transform.location.y
-        yaw = np.deg2rad(transform.rotation.yaw)
-        v = np.sqrt(self.player.get_velocity().x ** 2 +
-                    self.player.get_velocity().y ** 2)
-
-        return x, y, yaw, v
-
-    def precompute_parking_exit_path(carla_map, start_location: carla.Location,
-                                     spacing: float = 0.12):
-
-        start_wp = carla_map.get_waypoint(start_location, lane_type=carla.LaneType.Driving)
-
-        path = []
-        current_wp = start_wp
-
-        for i in range(150):
-            next_wps = current_wp.next(spacing)
-            if not next_wps:
-                break
-
-            candidate = next_wps[0]
-
-            if candidate.lane_type == carla.LaneType.Driving:
-
-                current_wp = candidate
-                path.append((current_wp.transform.location.x,
-                             current_wp.transform.location.y))
-            else:
-                continue
-
-        return np.array(path)
-
-    def choose_ahead_waypoint(self, waypoints, pos, heading):
-
-        rel = waypoints - pos
-        fronts = rel.dot(heading) > 0  # positive means ahead
-
-        try:
-            ahead_wps = waypoints[fronts]
-            dists = np.linalg.norm(ahead_wps - pos, axis=1)
-            return ahead_wps, np.argmin(dists)
-
-        except:
-            return False, False
-
     @torch.no_grad()
     def run_step(self, input_data, timestamp):
         """
@@ -223,99 +154,39 @@ class MTRAgent(AutonomousAgent):
             Use the self._global_plan member to access the geolocation route and self._global_plan_world_coord for 
             its world location counterpart.
         """
+        if not self._route_parsed:
+            self.parse_route()
 
-        """if timestamp < 2:
-            self.last_control = carla.VehicleControl()
-            return carla.VehicleControl()"""
+        # if timestamp < 2:
+        #     return carla.VehicleControl()
 
         if self._simulation_steps % int(0.1 / self._delta_t) == 1:
-            return self.last_control
+            return self._last_control
 
-        start_location = self.player.get_location()
+        world = CarlaDataProvider.get_world()
+        player = CarlaDataProvider.get_hero_actor()
 
-        x0, y0, yaw0, v0 = self.get_ego_vehicle_state()
+        # Trying to set up a Carla autopilot. Can ignore it in MPC controller.
+        if self.agent is None:
+            self.agent = BehaviorAgent(player, behavior="normal", opt_dict={'sampling_resolution': 1.0})
 
-        current_location = np.array([x0, y0])
-        current_velocity = v0
+        vehicles = world.get_actors().filter('vehicle.*')
 
-        if current_velocity <= 5:
-            multiplier = 1.2
-        elif current_velocity <= 10:
-            multiplier = 3.6
-        elif current_velocity <= 20:
-            multiplier = 6.2
-        elif current_velocity <= 30:
-            multiplier = 8
-        elif current_velocity <= 40:
-            multiplier = 10
-        elif current_velocity <= 50:
-            multiplier = 11
-        elif current_velocity <= 60:
-            multiplier = 12
-        elif current_velocity <= 70:
-            multiplier = 14
+        # actors = CarlaDataProvider.get_actors()
+        ego_transform = player.get_transform()
+        cur_pos = np.array([ego_transform.location.x, ego_transform.location.y])
+
+        if len(self._route) == 1:
+            target_pos, _ = self._route[0]
         else:
-            multiplier = 14
-
-        if self.use_precomputed_waypoints and timestamp % 20 == 0:
-            self._route = self.precompute_parking_exit_path(self.world.get_map(), start_location=start_location)
-            goal = self._route[-1]
-            self.temp_agent.set_destination(carla.Location(goal[0], goal[1], 0))
-        else:
-            if not self._route_parsed:
-                self.parse_route()
-
-            if len(self._route) == 1:
-                goal = self._route[0]
-            else:
-                # goal_indx = min(20, self._route.shape[0])
-                # goal = self._route[goal_indx-1]
-                goal = self._route[-1]
-                # distance = np.linalg.norm(goal - cur_pos)
-                # if distance < self._route_min_distance:
-                #   self._route.popleft()
-
-            if self.follow_agent:
-
-                self._route = None
-
-                wp0 = self.world.get_map().get_waypoint(start_location)
-                wpt = self.world.get_map().get_waypoint(carla.Location(goal[0], goal[1], 0))
-
-                self.temp_agent.set_destination(carla.Location(goal[0], goal[1], 0))
-                trace = self.temp_agent.trace_route(wp0, wpt)
-                self._route = []
-                for wp in trace:
-                    self._route.append([wp[0].transform.location.x,
-                                        wp[0].transform.location.y])
-                self._route = np.array(self._route)
-
-                # multiplier = multiplier * 2
-
-                self.follow_agent = False
-
-        ego_transform = self.player.get_transform()
-        fwd = ego_transform.get_forward_vector()
-        heading = np.array([fwd.x, fwd.y])
-
-        route_new, closest_index = self.choose_ahead_waypoint(waypoints=self._route, pos=current_location,
-                                                              heading=heading)
-
-        self._route = route_new
-
-        if route_new is not False:
-            termi = int(N * multiplier)
-            closest_k_waypoint = list(route_new[closest_index + 1: closest_index + 1 + termi])
-        else:
-            closest_k_waypoint = list(route_new[-1])
-
-        del route_new
+            target_pos, _ = self._route[1]
+            distance = np.linalg.norm(target_pos - cur_pos)
+            if distance < self._route_min_distance:
+                self._route.popleft()
 
         def dist(l):
             return math.sqrt((l.x - ego_transform.location.x) ** 2 + (l.y - ego_transform.location.y)
                              ** 2 + (l.z - ego_transform.location.z) ** 2)
-
-        vehicles = self.world.get_actors().filter('vehicle.*')
 
         vehicle_dist = []
 
@@ -324,7 +195,7 @@ class MTRAgent(AutonomousAgent):
             loc = transform.location
             yaw = transform.rotation.yaw
             vel = vehicle.get_velocity()
-            if vehicle.id != self.player.id:
+            if vehicle.id != player.id:
                 vehicle_dist.append((dist(loc), vehicle.id, vehicle))
             dim = vehicle.bounding_box.extent * 2
             traj = np.array([loc.x, loc.y, loc.z, dim.x, dim.y, dim.z, math.radians(yaw), vel.x, vel.y, 1])
@@ -333,7 +204,7 @@ class MTRAgent(AutonomousAgent):
 
         vehicle_dist.sort()
 
-        track_ids = [self.player.id]
+        track_ids = [player.id]
         for i in range(min(7, len(vehicle_dist))):  # find the 7 closest vehicles
             track_ids.append(vehicle_dist[i][1])
 
@@ -342,9 +213,7 @@ class MTRAgent(AutonomousAgent):
         info['vehicle_ids'] = track_ids
 
         info['map_infos'] = self.map_infos
-        # info['dynamic_map_infos'] = self.dynamic_map_infos
         ret_infos = create_scene_level_data(info, cfg.DATA_CONFIG)
-
         batch_dict = {
             'batch_size': 1,
             'input_dict': ret_infos,
@@ -353,56 +222,23 @@ class MTRAgent(AutonomousAgent):
         with torch.no_grad():
             batch_pred_dicts = self.model(batch_dict)
             final_pred_dicts = generate_prediction_dicts(batch_pred_dicts)[0]
-            # print("final_pred_dicts: ", final_pred_dicts)
-            # print("generate_prediction_dicts(batch_pred_dicts): ", generate_prediction_dicts(batch_pred_dicts))
-
-        del batch_pred_dicts, ret_infos, batch_dict
 
         pred_ego = final_pred_dicts[0]
         traj_index = np.argmax(pred_ego['pred_scores'])
-        # destination = pred_ego['pred_trajs'][traj_index][5]
+        destination = pred_ego['pred_trajs'][traj_index][5]
+        self.agent.set_destination(
+            carla.Location(destination[0].item(), destination[1].item(), ego_transform.location.z))
 
-        dyn_vehic_list = []
-        for i in range(1, len(final_pred_dicts)):
-            temp_vehic_index = np.argmax(final_pred_dicts[i]['pred_scores'])
-            temp_traj = final_pred_dicts[i]['pred_trajs'][temp_vehic_index][: 10]
-            dyn_vehic_list.append(temp_traj)
+        try:
+            control = self.agent.run_step()
+        except:
+            destination = pred_ego['pred_trajs'][traj_index][30]
+            self.agent.set_destination(
+                carla.Location(destination[0].item(), destination[1].item(), ego_transform.location.z))
+            control = self.agent.run_step()
+        control.manual_gear_shift = False
 
-        x0, y0, yaw0, v0 = self.get_ego_vehicle_state()
-
-        temp_list = []
-
-        if isinstance(closest_k_waypoint[-1], np.float64):
-            temp_list.append(closest_k_waypoint)
-            waypoints_ = temp_list * 10
-        else:
-            waypoints_ = closest_k_waypoint if len(closest_k_waypoint) >= 10 else closest_k_waypoint + \
-                                                                                  [closest_k_waypoint[-1]] * (10 - len(
-                closest_k_waypoint))
-
-        self.mpc.reset_solver(x0, y0, yaw0, v0,
-                              self.mpc.get_static_obstacles(np.array(pred_ego['pred_trajs'][traj_index][: N])), \
-                              self.mpc.get_static_obstacles_soft(np.array(pred_ego['pred_trajs'][traj_index][: N])),
-                              waypoints_)
-
-        waypoints_ = None
-
-        self.mpc.update_cost_function(goal, dyn_vehic_list)
-        self.mpc.solve()
-
-        if self.mpc.is_success:
-            print("is_success : True")
-            wheel_angle, acceleration = self.mpc.get_controls_value()
-            throttle, brake, steer = self.mpc.process_control_inputs(wheel_angle, acceleration)
-            control = carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
-
-        else:
-            print("is_success : False")
-            self.temp_agent.set_destination(carla.Location(goal[0], goal[1], 0))
-            control = self.temp_agent.run_step()
-            control.manual_gear_shift = False
-
-        self.last_control = control
+        self._last_control = control
 
         """
         input_data: A dictionary containing sensor data for the requested sensors.
