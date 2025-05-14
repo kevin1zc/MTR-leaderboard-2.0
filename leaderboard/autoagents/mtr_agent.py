@@ -57,7 +57,11 @@ class MTRAgent(AutonomousAgent):
         model_dir = os.path.join(mtr_dir, "../../carla_api/model/")
         model_dir = os.path.abspath(model_dir)
 
-        map_info_path = os.path.join(model_dir, 'map_infos.pkl')
+
+        map_name = CarlaDataProvider.get_world().get_map().name
+        _, simple_name = os.path.split(map_name)
+
+        map_info_path = os.path.join(model_dir, f'{simple_name}.pkl')
 
         with open(map_info_path, 'rb') as file:
             self.map_infos = pickle.load(file)
@@ -154,8 +158,8 @@ class MTRAgent(AutonomousAgent):
         if not self._route_parsed:
             self.parse_route()
 
-        if timestamp < 2:
-            return carla.VehicleControl()
+        # if timestamp < 2:
+        #     return carla.VehicleControl()
 
         if self._simulation_steps % int(0.1 / self._delta_t) == 1:
             return self._last_control
