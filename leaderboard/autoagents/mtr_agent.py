@@ -229,6 +229,7 @@ class MTRAgent(AutonomousAgent):
             return carla.VehicleControl()"""
 
         if self._simulation_steps % int(0.1 / self._delta_t) == 1:
+            self._simulation_steps += 1
             return self.last_control
 
         start_location = self.player.get_location()
