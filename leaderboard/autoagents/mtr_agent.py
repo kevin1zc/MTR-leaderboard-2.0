@@ -171,7 +171,7 @@ class MTRAgent(AutonomousAgent):
 
         return x, y, yaw, v
 
-    def precompute_parking_exit_path(carla_map, start_location: carla.Location,
+    def precompute_parking_exit_path(self, carla_map, start_location: carla.Location,
                                      spacing: float = 0.12):
 
         start_wp = carla_map.get_waypoint(start_location, lane_type=carla.LaneType.Driving)
@@ -227,11 +227,9 @@ class MTRAgent(AutonomousAgent):
         """if timestamp < 2:
             self.last_control = carla.VehicleControl()
             return carla.VehicleControl()"""
-
         if self._simulation_steps % int(0.1 / self._delta_t) == 1:
             self._simulation_steps += 1
             return self.last_control
-
         start_location = self.player.get_location()
 
         x0, y0, yaw0, v0 = self.get_ego_vehicle_state()
@@ -258,7 +256,7 @@ class MTRAgent(AutonomousAgent):
         else:
             multiplier = 14
 
-        if self.use_precomputed_waypoints and timestamp % 20 == 0:
+        if self.use_precomputed_waypoints and timestamp < 0.1:
             self._route = self.precompute_parking_exit_path(self.world.get_map(), start_location=start_location)
             goal = self._route[-1]
             self.temp_agent.set_destination(carla.Location(goal[0], goal[1], 0))
