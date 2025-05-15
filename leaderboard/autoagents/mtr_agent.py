@@ -258,7 +258,7 @@ class MTRAgent(AutonomousAgent):
 
         if self.use_precomputed_waypoints and timestamp < 0.1:
             self._route = self.precompute_parking_exit_path(self.world.get_map(), start_location=start_location)
-            goal = self._route[-1]
+            goal = self._route[1]
             self.temp_agent.set_destination(carla.Location(goal[0], goal[1], 0))
         else:
             if not self._route_parsed:
@@ -269,7 +269,7 @@ class MTRAgent(AutonomousAgent):
             else:
                 # goal_indx = min(20, self._route.shape[0])
                 # goal = self._route[goal_indx-1]
-                goal = self._route[-1]
+                goal = self._route[1]
                 # distance = np.linalg.norm(goal - cur_pos)
                 # if distance < self._route_min_distance:
                 #   self._route.popleft()
